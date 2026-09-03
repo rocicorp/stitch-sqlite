@@ -1,0 +1,27 @@
+# stitch-sqlite's own CI. This directory is published as its own repository through josh
+# (`scripts/publish-stitch-sqlite.sh` at the monorepo root holds the mapping: this directory is
+# that repository's root, plus LICENSE and the design doc). GitHub runs this workflow THERE —
+# never in the rindle monorepo, whose workflows live at its root.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # rocicorp requires actions pinned to a full commit SHA (the comment is the tag they were
+    # resolved from).
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # Stock SQLite here: the wal2 cases fall back to wal and say so.
+      - run: cargo test
+      - run: cargo test --doc

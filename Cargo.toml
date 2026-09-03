@@ -1,0 +1,38 @@
+[package]
+name = "stitch-sqlite"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Published as its own repository through josh (scripts/publish-stitch-sqlite.sh).
+repository = "https://github.com/rocicorp/stitch-sqlite"
+description = "A SQLite B-tree linker: stitch closed one-table-per-file SQLite databases into one file by relocating pages — never by re-inserting a row (design 415)."
+# Not on crates.io (yet); consumers outside Rust take the binary below, or the repository.
+publish = false
+
+# The first consumer (Zero's initial sync, design 415 §6.0) is not Rust: it spawns this binary,
+# which cargo-dist ships for the workspace targets. A new dist crate must ALSO be listed in
+# scripts/stamp-dist-crate-version.sh or the release skips it (see dist-workspace.toml).
+[package.metadata.dist]
+dist = true
+
+[[bin]]
+name = "stitch-sqlite"
+path = "src/main.rs"
+
+[dependencies]
+# Same version + `bundled` as every other SQLite-linking member, so this crate links the ONE
+# vendored hctree-bedrock amalgamation through the workspace `[patch.crates-io]` redirect. SQLite
+# is used for exactly four things here: laying out the destination skeleton (so SQLite, not us,
+# writes page 1 and allocates every root), reading each source's `sqlite_schema`, the post-link
+# SQL pass over SQLite's OWN state (`sqlite_sequence`, `sqlite_stat*`, `journal_mode`), and the
+# opt-in `quick_check` / `integrity_check`. The page copy itself never goes through SQLite.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# `Report` serializes for the binary's `--json` output; both are workspace-wide dependencies.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# `functions`: the tests register a scalar function to prove `Options::register` reaches every
+# connection the linker opens (an expression index over it must survive `integrity_check`).
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+tempfile = "3"
