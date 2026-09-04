@@ -131,7 +131,6 @@ pub enum Stats {
 }
 
 /// Options for [`stitch`].
-#[derive(Default)]
 pub struct Options {
     pub verify: Verify,
     pub journal_mode: JournalMode,
@@ -139,6 +138,26 @@ pub struct Options {
     /// Replace an existing destination (its sidecars included). Off by default.
     pub overwrite: bool,
     pub register: Option<Box<RegisterFn>>,
+    /// How many sources to link at once (design 415 §7). `1` — the default — is the sequential
+    /// walk with one allocator over the tail of the file. Above that, each source is given a
+    /// **reserved, disjoint destination page range** computed from its header, and the walks run
+    /// on that many threads writing to disjoint regions of one file. Measured on 6 sources ×
+    /// 2 M rows: the link phase goes 1.54 s → 0.61 s at 4 (`spikes/stitch-perf/FINDINGS.md`).
+    /// Clamped to the number of sources; more threads than cores does not help.
+    pub threads: usize,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            verify: Verify::default(),
+            journal_mode: JournalMode::default(),
+            stats: Stats::default(),
+            overwrite: false,
+            register: None,
+            threads: 1,
+        }
+    }
 }
 
 impl std::fmt::Debug for Options {
@@ -148,6 +167,7 @@ impl std::fmt::Debug for Options {
             .field("journal_mode", &self.journal_mode)
             .field("stats", &self.stats)
             .field("overwrite", &self.overwrite)
+            .field("threads", &self.threads)
             .field("register", &self.register.as_ref().map(|_| "fn"))
             .finish()
     }
@@ -178,6 +198,13 @@ pub struct Report {
     pub bytes: u64,
     /// Freelist pages the sources carried; unreachable from any root, so never copied.
     pub source_freelist_pages: u64,
+    /// Sources linked at once. `1` is the sequential walk; above that each source got a
+    /// reserved destination range (`Options::threads`).
+    pub link_threads: usize,
+    /// Pages on the OUTPUT's freelist. Normally `0`: reservation is exact, so a parallel link
+    /// leaves no hole. Non-zero means a source carried pages reachable from nothing, which the
+    /// linker parks on the freelist rather than leaving unaccounted for.
+    pub freelist_pages: u32,
     pub link: LinkStats,
     pub durations: Durations,
     pub verify: Verify,
@@ -286,6 +313,149 @@ fn open_dest(tmp: &Path, opts: &Options, context: &'static str) -> Result<Connec
     Ok(conn)
 }
 
+/// One source's reserved destination range, `[base, end)`.
+struct Reservation {
+    base: u32,
+    end: u32,
+}
+
+/// Reserve a contiguous destination range per source (design 415 §7), sized **exactly**.
+///
+/// Every page of a source is page 1, a freelist page, or a b-tree page — there are no
+/// pointer-map pages, because the contract refuses `auto_vacuum`. Of the b-tree pages, the
+/// linker does not allocate the ROOT of each linked tree (the skeleton owns those), and does not
+/// copy the internal trees at all (`sqlite_sequence`, `sqlite_stat*`). So
+///
+/// ```text
+/// reserve = page_count − 1 − freelist_count − internal_tree_pages − linked_tree_count
+/// ```
+///
+/// §7 gives the first three terms; the last two are what the spike found missing. Reserving an
+/// upper bound instead leaves a hole in the output, and a hole is not cosmetic — SQLite's
+/// `integrity_check` reports "Page N is never used". `internal_tree_pages` costs a count-only
+/// walk of trees that are one or two pages by nature.
+fn reserve_ranges(
+    sources: &[Source],
+    dst: &File,
+    first_free: u32,
+    lock: u32,
+) -> Result<(Vec<Reservation>, u32), StitchError> {
+    let mut out = Vec::with_capacity(sources.len());
+    let mut next = first_free;
+    for s in sources {
+        let trees = s.schema.iter().filter(|r| r.is_linked_tree()).count() as u64;
+        let internal_roots: Vec<u32> = s
+            .schema
+            .iter()
+            .filter(|r| r.rootpage > 1 && source::is_internal_name(&r.name))
+            .map(|r| r.rootpage)
+            .collect();
+        let mut internal = 0u64;
+        if !internal_roots.is_empty() {
+            // Only pay for a Linker (and its buffers) when there is something to count.
+            let mut linker = link::Linker::open(s, dst)?;
+            for root in internal_roots {
+                internal += linker.count_tree(root)?;
+            }
+        }
+        let reserve = u64::from(s.page_count)
+            .checked_sub(1)
+            .and_then(|n| n.checked_sub(u64::from(s.header.freelist_count)))
+            .and_then(|n| n.checked_sub(internal))
+            .and_then(|n| n.checked_sub(trees))
+            .ok_or_else(|| StitchError::Corrupt {
+                path: s.path.clone(),
+                page: 1,
+                why: format!(
+                    "{} pages cannot hold page 1 + {} freelist + {internal} internal + {trees} roots",
+                    s.page_count, s.header.freelist_count
+                ),
+            })?;
+        let base = next;
+        let mut end = u32::try_from(reserve)
+            .ok()
+            .and_then(|n| base.checked_add(n))
+            .ok_or_else(|| StitchError::Verification {
+                stage: "link",
+                detail: "the linked output would exceed 2^32 pages".into(),
+            })?;
+        // The allocator skips the lock-byte page, so a range spanning it needs one more slot.
+        if base <= lock && lock < end {
+            end += 1;
+        }
+        out.push(Reservation { base, end });
+        next = end;
+    }
+    Ok((out, next))
+}
+
+/// Link every source in parallel into its reserved range. Threads write to disjoint regions of
+/// one destination handle — `write_all_at` takes `&self` and needs no coordination.
+///
+/// Returns `(pages the output spans, pages inside the ranges the walks did not use)`. The second
+/// is normally empty; see [`link::write_freelist`].
+#[allow(clippy::too_many_arguments)]
+fn link_parallel(
+    sources: &[Source],
+    skeleton: &skeleton::Skeleton,
+    dst: &File,
+    first_free: u32,
+    lock: u32,
+    threads: usize,
+    stats: &mut LinkStats,
+) -> Result<(u32, Vec<u32>), StitchError> {
+    let (ranges, end) = reserve_ranges(sources, dst, first_free, lock)?;
+    let mut used: Vec<u32> = Vec::with_capacity(sources.len());
+    let indices: Vec<usize> = (0..sources.len()).collect();
+    for wave in indices.chunks(threads) {
+        let results: Vec<Result<(LinkStats, u32), StitchError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = wave
+                .iter()
+                .map(|&i| {
+                    let (source, range) = (&sources[i], &ranges[i]);
+                    scope.spawn(move || -> Result<(LinkStats, u32), StitchError> {
+                        let mut linker = link::Linker::open(source, dst)?;
+                        let mut alloc = link::Allocator::ranged(range.base, lock, range.end);
+                        let mut st = LinkStats::default();
+                        for row in source.schema.iter().filter(|r| r.is_linked_tree()) {
+                            let &root = skeleton.roots.get(&row.name).ok_or_else(|| {
+                                StitchError::NoRoot {
+                                    name: row.name.clone(),
+                                }
+                            })?;
+                            linker.link_tree(row.rootpage, root, &mut alloc, &mut st)?;
+                        }
+                        linker.flush()?;
+                        st.lock_page_skipped = alloc.skipped_lock();
+                        Ok((st, alloc.next_free()))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        Err(StitchError::Verification {
+                            stage: "link",
+                            detail: "a linker thread panicked".into(),
+                        })
+                    })
+                })
+                .collect()
+        });
+        for r in results {
+            let (st, next_free) = r?;
+            stats.merge(&st);
+            used.push(next_free);
+        }
+    }
+    let mut spare = Vec::new();
+    for (range, &next_free) in ranges.iter().zip(&used) {
+        spare.extend((next_free..range.end).filter(|&p| p != lock));
+    }
+    Ok((end - 1, spare))
+}
+
 fn link_into(
     sources: &[Source],
     dest: &Path,
@@ -345,28 +515,36 @@ fn link_into(
         }
     }
     let dest_len = dst.metadata().map_err(io_err("stat destination"))?.len();
-    let mut alloc = link::Allocator::new(
-        (dest_len / u64::from(page_size)) as u32 + 1,
-        template.lock_byte_page(),
-    );
+    let first_free = (dest_len / u64::from(page_size)) as u32 + 1;
+    let lock = template.lock_byte_page();
+    let threads = opts.threads.max(1).min(sources.len());
     let mut stats = LinkStats::default();
-    for s in sources {
-        let linker = link::Linker::open(s, &dst)?;
-        for row in s.schema.iter().filter(|r| r.is_linked_tree()) {
-            let &root = skeleton
-                .roots
-                .get(&row.name)
-                .ok_or_else(|| StitchError::NoRoot {
-                    name: row.name.clone(),
-                })?;
-            linker.link_tree(row.rootpage, root, &mut alloc, &mut stats)?;
+    let (linked_pages, spare) = if threads > 1 {
+        link_parallel(sources, &skeleton, &dst, first_free, lock, threads, &mut stats)?
+    } else {
+        let mut alloc = link::Allocator::new(first_free, lock);
+        for s in sources {
+            let mut linker = link::Linker::open(s, &dst)?;
+            for row in s.schema.iter().filter(|r| r.is_linked_tree()) {
+                let &root = skeleton
+                    .roots
+                    .get(&row.name)
+                    .ok_or_else(|| StitchError::NoRoot {
+                        name: row.name.clone(),
+                    })?;
+                linker.link_tree(row.rootpage, root, &mut alloc, &mut stats)?;
+            }
+            // The walk leaves buffered runs open; nothing is on disk until this returns.
+            linker.flush()?;
         }
-    }
-    stats.lock_page_skipped = alloc.skipped_lock();
-    let linked_pages = alloc.pages();
+        stats.lock_page_skipped = alloc.skipped_lock();
+        (alloc.pages(), Vec::new())
+    };
+    let (freelist_trunk, freelist_pages) =
+        link::write_freelist(&dst, page_size as usize, template.usable(), &spare)?;
     dst.set_len(u64::from(linked_pages) * u64::from(page_size))
         .map_err(io_err("set destination length"))?;
-    header::patch_after_link(&mut page1, linked_pages);
+    header::patch_after_link(&mut page1, linked_pages, freelist_trunk, freelist_pages);
     dst.write_all_at(&page1, 0)
         .map_err(io_err("write destination header"))?;
     let link_ms = ms(t.elapsed());
@@ -457,6 +635,8 @@ fn link_into(
         encoding: template.encoding_name(),
         dest_pages,
         bytes,
+        link_threads: threads,
+        freelist_pages,
         source_freelist_pages: sources
             .iter()
             .map(|s| u64::from(s.header.freelist_count))

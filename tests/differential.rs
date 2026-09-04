@@ -582,6 +582,63 @@ fn oracle_sees_a_different_tree_shape() {
     assert_same_database(&out, &reference);
 }
 
+/// `Options::threads` links the sources in parallel, each into a reserved destination page
+/// range (design 415 §7). The reservation is computed to be EXACT — page 1, the freelist, the
+/// skeleton-owned roots and the never-copied internal trees all come off it — so the parallel
+/// output must span the same pages as the sequential one, hold the same b-trees page for page,
+/// and carry no freelist. A hole would show up as `integrity_check`'s "Page N is never used",
+/// which `full()` runs, and as a non-zero `freelist_count`, which `assert_same_database` checks.
+#[test]
+fn a_parallel_link_matches_the_sequential_link_exactly() {
+    let lab = Lab::new();
+    let sources = spike_sources(&lab, 3000);
+    let sequential = lab.path("sequential.db");
+    let seq = stitch(&sources, &sequential, &full()).expect("sequential stitch");
+    let parallel = lab.path("parallel.db");
+    let par = stitch(
+        &sources,
+        &parallel,
+        &Options {
+            threads: 4,
+            ..full()
+        },
+    )
+    .expect("parallel stitch");
+
+    assert_eq!(seq.link_threads, 1);
+    assert_eq!(par.link_threads, 4.min(sources.len()));
+    assert_eq!(par.freelist_pages, 0, "the reservation must be exact");
+    assert_eq!(seq.freelist_pages, 0);
+    // Same pages walked, same pages emitted: only the ORDER of allocation differs.
+    assert_eq!(par.link, seq.link);
+    assert_eq!(par.dest_pages, seq.dest_pages);
+    assert_eq!(par.bytes, seq.bytes);
+    assert_parity_all(&parallel, &sources);
+    assert_same_database(&parallel, &sequential);
+}
+
+/// One source is the degenerate case for range reservation, and `threads` above the source
+/// count must clamp rather than reserve empty ranges.
+#[test]
+fn a_parallel_link_of_one_source_clamps_to_one_thread() {
+    let lab = Lab::new();
+    let sources = spike_sources(&lab, 500);
+    let one = std::slice::from_ref(&sources[0]);
+    let out = lab.path("one.db");
+    let report = stitch(
+        one,
+        &out,
+        &Options {
+            threads: 8,
+            ..full()
+        },
+    )
+    .expect("stitch one source on 8 threads");
+    assert_eq!(report.link_threads, 1);
+    assert_eq!(report.freelist_pages, 0);
+    assert_parity_all(&out, one);
+}
+
 #[test]
 fn links_the_spike_shapes_and_passes_integrity_check() {
     let lab = Lab::new();
