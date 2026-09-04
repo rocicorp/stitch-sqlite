@@ -52,7 +52,9 @@ pub fn run(args: &[String]) -> i32 {
                 opts.threads = match value(&mut i).map(str::parse::<usize>) {
                     Some(Ok(n)) if n >= 1 => n,
                     other => {
-                        return usage_err(&format!("--threads: expected a positive integer, got {other:?}"))
+                        return usage_err(&format!(
+                            "--threads: expected a positive integer, got {other:?}"
+                        ))
                     }
                 }
             }
