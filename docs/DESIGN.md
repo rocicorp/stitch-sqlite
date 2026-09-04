@@ -97,6 +97,22 @@ concurrent index builds conflict and retry from scratch; and the relocation is a
 rewrite of the index just built. The daemon deleted its own `BEGIN CONCURRENT` derivation probe
 for adjacent reasons (306 S5). Separate files + a linker is the shape that actually parallelizes.
 
+**Measured 2026-09-04** — [`../spikes/wal2-concurrent-import/`](../spikes/wal2-concurrent-import/),
+which builds the same 6-table / 3 M-row / 12-index database six ways against the vendored
+amalgamation. The claim above holds and the margin is wide: 6 threads on one wal2 file with
+ordinary `BEGIN IMMEDIATE` is **0.89–0.93×** of one thread (wal2 adds no second writer — one
+`WAL_WRITE_LOCK`, `walWriteLock()` is journal-mode-agnostic); with `BEGIN CONCURRENT` the *data*
+wave does parallelize (**3.0–3.2×**, zero conflicts on disjoint tables) but the *index* wave is
+**0.77–0.81×** and needs 36–39 conflict-retries to land 12 indexes, for **1.09–1.17×** end to
+end — **1.23–1.41×** even when the indexes are built serially to sidestep the conflicts — against
+**3.5–3.6×** for the same tables built as six separate files, before the linker runs. Two
+mechanisms, both pinned in [`FINDINGS.md`](../spikes/wal2-concurrent-import/FINDINGS.md): DDL is a
+*global* barrier under `BEGIN CONCURRENT` (a `CREATE INDEX` conflicts with every other transaction,
+and every in-flight concurrent *data* transaction conflicts with it), and a concurrent transaction
+**cannot spill its page cache** (`pagerStress`: `if( pPager->pAllRead ) return SQLITE_OK;`), so its
+resident set grows with the transaction rather than with `cache_size` — +119 MiB for a 168 MiB
+one-transaction load, against +384 KiB for the same load in plain mode.
+
 ---
 
 ## 2. The contract — what the loader promises, and what each promise removes
