@@ -565,11 +565,14 @@ impl<'a> Linker<'a> {
         while let Some(sp) = stack.pop() {
             visited += 1;
             if visited > u64::from(self.source.page_count) {
-                return Err(self.corrupt(sp, "b-tree visits more pages than the file holds (cycle)"));
+                return Err(
+                    self.corrupt(sp, "b-tree visits more pages than the file holds (cycle)")
+                );
             }
             self.read(sp, &mut buf)?;
-            let kind = Kind::from_flag(buf[0])
-                .ok_or_else(|| self.corrupt(sp, format!("unexpected b-tree flag {:#04x}", buf[0])))?;
+            let kind = Kind::from_flag(buf[0]).ok_or_else(|| {
+                self.corrupt(sp, format!("unexpected b-tree flag {:#04x}", buf[0]))
+            })?;
             let hdr = kind.header_len();
             let ncell = be16(&buf, 3);
             let array_end = hdr + 2 * ncell;
@@ -595,19 +598,23 @@ impl<'a> Linker<'a> {
                         continue;
                     }
                 }
-                let (payload, n) = varint(&buf[cursor..self.usable])
-                    .ok_or_else(|| self.corrupt(sp, format!("cell {i}: payload varint runs off")))?;
+                let (payload, n) = varint(&buf[cursor..self.usable]).ok_or_else(|| {
+                    self.corrupt(sp, format!("cell {i}: payload varint runs off"))
+                })?;
                 cursor += n;
                 if kind == Kind::LeafTable {
-                    let (_rowid, n) = varint(&buf[cursor..self.usable])
-                        .ok_or_else(|| self.corrupt(sp, format!("cell {i}: rowid varint runs off")))?;
+                    let (_rowid, n) = varint(&buf[cursor..self.usable]).ok_or_else(|| {
+                        self.corrupt(sp, format!("cell {i}: rowid varint runs off"))
+                    })?;
                     cursor += n;
                 }
                 let payload = payload as usize;
                 let local = local_payload(kind, payload, self.usable);
                 if payload > local {
                     if cursor + local + 4 > self.usable {
-                        return Err(self.corrupt(sp, "overflow pointer lies outside the usable area"));
+                        return Err(
+                            self.corrupt(sp, "overflow pointer lies outside the usable area")
+                        );
                     }
                     let mut next = be32(&buf, cursor + local);
                     while next != 0 {

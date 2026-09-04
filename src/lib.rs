@@ -520,7 +520,9 @@ fn link_into(
     let threads = opts.threads.max(1).min(sources.len());
     let mut stats = LinkStats::default();
     let (linked_pages, spare) = if threads > 1 {
-        link_parallel(sources, &skeleton, &dst, first_free, lock, threads, &mut stats)?
+        link_parallel(
+            sources, &skeleton, &dst, first_free, lock, threads, &mut stats,
+        )?
     } else {
         let mut alloc = link::Allocator::new(first_free, lock);
         for s in sources {
