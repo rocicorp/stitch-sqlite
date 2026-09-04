@@ -321,11 +321,23 @@ pub fn stitch(sources: &[&Path], dest: &Path, opts: &Options) -> Result<Report, 
   second pass rewrites josh's token messages. `pull` ports public commits back by path onto a
   review branch, keeping author, dates, and message plus a `Public-Commit` trailer, and a
   ported commit renders as the public commit itself — so the round trip is exact even though
-  GitHub signs the commits it creates. Rules: **publish from `main`** (a rendered commit is a
-  function of the monorepo commit; rebasing or amending published commits re-renders them and
-  the public main stops being a fast-forward — the script refuses; `--force` re-anchors while
-  nobody has built on the public history), merge ported commits without squashing, and push the
-  import tag to the monorepo remote. The crate builds against stock SQLite (`rusqlite`
+  GitHub signs the commits it creates. Three rocicorp org rulesets bind the public `main`, and
+  nobody can bypass them: pull request only (squash or rebase — a merge commit is not offered),
+  no force-push, and every commit in a pull request must carry an SSH signature from a key in
+  rocicorp/.github's `signing/allowed_signers`. So `publish` signs the rendered commits
+  (`commit-tree -S`, which is why it runs where the signing key is), pushes them to a
+  `mirror/<sha>` branch — only `main` is ruled — and opens a pull request, **merged with
+  "Rebase and merge"**. Merging is what creates the public commits: GitHub re-commits them, so
+  what lands is never the object that was pushed, and rebase is the only offered method that
+  keeps them one-to-one with ours, message and tree intact. The `Monorepo-Commit` trailer
+  closes that loop — the render emits the public object wherever the trailer, the tree, and the
+  parent all agree, so every publish re-converges on GitHub's rewrite of the last one, and the
+  newest reused commit is the anchor: anything after it on the public main came from somewhere
+  else, which is what `publish` refuses on and `pull` ports. Rules: **publish from `main`** and
+  never rewrite a published commit (a rendered commit is a function of the monorepo commit;
+  amend one and its trailer on the public side names a commit that is gone, with no force-push
+  to fall back on), merge ported commits without squashing, and push the import tag to the
+  monorepo remote. The crate builds against stock SQLite (`rusqlite`
   bundled); its wal2 assertions fall back to wal there and say so, and the workspace's wal2
   link is pinned by `rindle-cli`'s `workspace_build_is_wal2_capable`. The crate's own CI
   workflow lives at `rust/stitch-sqlite/.github/workflows/ci.yml`, inert here, live there.
