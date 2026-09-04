@@ -310,34 +310,28 @@ pub fn stitch(sources: &[&Path], dest: &Path, opts: &Options) -> Result<Report, 
 - Register in `README.md`'s crate table; `infra/tests/ci-sync.mjs` needs nothing for a plain
   member.
 - **Published as its own repository**, [`rocicorp/stitch-sqlite`](https://github.com/rocicorp/stitch-sqlite),
-  through josh: `scripts/publish-stitch-sqlite.sh` is the only place the mapping lives. The
-  public history is ONE import commit — the monorepo commit tagged `stitch-sqlite/import`,
-  squashed, so nothing before it is visible — then one commit per monorepo commit after it
-  that touches a published path, with that commit's message and a `Monorepo-Commit` trailer.
-  josh renders it with the composition filter `:[::LICENSE, ::docs/DESIGN.md=designs/415-…,
-  :/rust/stitch-sqlite, :/rust/rindle-stitch-sqlite]` (file mappings first so the reverse pass
-  sends LICENSE and the doc back to their monorepo homes; the old crate path stays because josh
-  does not follow renames) and a squash file naming the import and every later commit; a
-  second pass rewrites josh's token messages. `pull` ports public commits back by path onto a
-  review branch, keeping author, dates, and message plus a `Public-Commit` trailer, and a
-  ported commit renders as the public commit itself — so the round trip is exact even though
-  GitHub signs the commits it creates. Three rocicorp org rulesets bind the public `main`, and
-  nobody can bypass them: pull request only (squash or rebase — a merge commit is not offered),
-  no force-push, and every commit in a pull request must carry an SSH signature from a key in
-  rocicorp/.github's `signing/allowed_signers`. So `publish` signs the rendered commits
-  (`commit-tree -S`, which is why it runs where the signing key is), pushes them to a
-  `mirror/<sha>` branch — only `main` is ruled — and opens a pull request, **merged with
-  "Rebase and merge"**. Merging is what creates the public commits: GitHub re-commits them, so
-  what lands is never the object that was pushed, and rebase is the only offered method that
-  keeps them one-to-one with ours, message and tree intact. The `Monorepo-Commit` trailer
-  closes that loop — the render emits the public object wherever the trailer, the tree, and the
-  parent all agree, so every publish re-converges on GitHub's rewrite of the last one, and the
-  newest reused commit is the anchor: anything after it on the public main came from somewhere
-  else, which is what `publish` refuses on and `pull` ports. Rules: **publish from `main`** and
-  never rewrite a published commit (a rendered commit is a function of the monorepo commit;
-  amend one and its trailer on the public side names a commit that is gone, with no force-push
-  to fall back on), merge ported commits without squashing, and push the import tag to the
-  monorepo remote. The crate builds against stock SQLite (`rusqlite`
+  by copy: `scripts/publish-stitch-sqlite.sh` is the only place the mapping lives —
+  `rust/stitch-sqlite/` as the repository root, `LICENSE`, and this doc as `docs/DESIGN.md`.
+  `publish` replays every monorepo commit that touches one of those paths into a working clone,
+  one public commit each, keeping the message and author and adding a `Monorepo-Commit`
+  trailer, then pushes a `mirror/<sha>` branch and opens a pull request; `pull` copies the
+  public main back over this repository's copy, for review as an ordinary uncommitted diff.
+  The public history starts at ONE import commit, the monorepo commit tagged
+  `stitch-sqlite/import`, squashed, so nothing before it is visible.
+  **Nothing is tracked on this side**: the newest `Monorepo-Commit` trailer on the public main
+  is where the next publish resumes, so no history has to be reproducible and it does not
+  matter how the pull request is merged — squash or rebase, GitHub rewrites the commits either
+  way and the trailer survives in the message. Resuming too far back only replays commits that
+  change nothing, and those are skipped. (An earlier revision rendered the history with josh
+  instead. It was retired 2026-09-04: a filtered commit is a function of the monorepo commit,
+  so the render had to reproduce the published history exactly — which a pull-request merge
+  makes impossible, since merging is what creates the public commits. Everything that cost —
+  the squash file, the message-rewrite pass, the anchor, the reverse port — was in service of
+  that one invariant.) The rocicorp org rules the public `main` and nobody can bypass it: pull
+  request only, no force-push, and every commit in a pull request must be SSH-signed by a key
+  in rocicorp/.github's `signing/allowed_signers`. Both fall out of committing in a real clone
+  — `commit.gpgsign` signs them, and only `main` is ruled, so the mirror branch is free.
+  The crate builds against stock SQLite (`rusqlite`
   bundled); its wal2 assertions fall back to wal there and say so, and the workspace's wal2
   link is pinned by `rindle-cli`'s `workspace_build_is_wal2_capable`. The crate's own CI
   workflow lives at `rust/stitch-sqlite/.github/workflows/ci.yml`, inert here, live there.
