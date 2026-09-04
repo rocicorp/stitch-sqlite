@@ -474,6 +474,41 @@ allocator never contends). The **parallel build** is where the hours go: N table
 `CREATE INDEX` on its own connection with `PRAGMA threads = k` for the sort. What does *not* shrink
 is one table's b-tree build; §9 is the answer if a single table dominates.
 
+### 7.1 Measured and implemented (2026-09-04)
+
+[`../spikes/stitch-perf/`](../spikes/stitch-perf/) ports the walk to C with the I/O strategy
+switchable and measures each candidate on 6 sources × 2 M rows (600 966 pages, 2 347 MiB, 4 vCPU,
+median of 3). Two changes landed in the crate:
+
+| | link s | fsync s | link+fsync |
+| --- | ---: | ---: | ---: |
+| as shipped before — 1 thread, one `pread` + one `pwrite` per page | 4.37 | 3.06 | 7.43 |
+| chunked reads + run-coalesced writes | 1.95 | 2.52 | 4.51 |
+| … + sources linked in parallel into reserved ranges (`threads = 4`) | **0.61** | 2.16 | 2.78 |
+
+The **link** is 7.2× faster and its 1.2 M syscalls become 6 384; what is left is the destination
+`fsync`, which is the disk (~900 MiB/s here) and which no linker change removes. So the link stops
+being the part that does not scale, and the stitch becomes bounded by the output write.
+
+Two findings worth carrying:
+
+- **Both sides of the copy need K buffered slots, not one.** The walk emits and consumes two
+  interleaved ascending streams — the current subtree's pages, and the overflow pages allocated
+  *behind* them, since a leaf's overflow is allocated after the leaf. A single write run therefore
+  coalesced 600 966 pages into only 482 268 writes (runs of 1.25 pages); four LRU slots make it
+  3 498. A single read window is worse than useless: it re-read 3.2 bytes per byte used and made
+  batching **slower** than the baseline on warm sources. `link.rs` uses 4 slots of 512 KiB a side.
+- **§7's reservation formula is not quite exact.** "Minus freelist pages" leaves out two terms:
+  the linked trees' ROOTS come from the skeleton, and the internal trees (`sqlite_sequence`,
+  `sqlite_stat*`) are never copied. So
+  `reserve = page_count − 1 − freelist_count − internal_tree_pages − linked_tree_count`, with
+  `internal_tree_pages` from a count-only walk of trees that are one or two pages by nature.
+  Over-reserving leaves a hole, and a hole is not cosmetic: `integrity_check` reports
+  "Page N is never used", and `differential.rs` asserts the output has no freelist at all. A
+  leftover-to-freelist path stays as the safety net.
+
+`Options::threads` / `--threads N` selects it; the default is still the sequential walk.
+
 ---
 
 ## 8. Awkward cases and their disposition

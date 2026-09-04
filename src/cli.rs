@@ -17,6 +17,8 @@ options:
                                 structural checks and the smoke probe always run)
   --journal-mode delete|wal|wal2  output journal mode (default delete: the file as SQLite wrote it)
   --stats skip|copy|analyze     sqlite_stat* handling (default skip; copy = the sources' rows)
+  --threads N                   link N sources at once, each into a reserved destination page
+                                range (default 1: the sequential walk)
   --force                       replace <out.db> if it exists
   --json                        print the report as JSON
   --quiet                       print nothing on success
@@ -46,6 +48,14 @@ pub fn run(args: &[String]) -> i32 {
                 return 0;
             }
             "--force" => opts.overwrite = true,
+            "--threads" => {
+                opts.threads = match value(&mut i).map(str::parse::<usize>) {
+                    Some(Ok(n)) if n >= 1 => n,
+                    other => {
+                        return usage_err(&format!("--threads: expected a positive integer, got {other:?}"))
+                    }
+                }
+            }
             "--json" => json = true,
             "--quiet" => quiet = true,
             "--verify" => {

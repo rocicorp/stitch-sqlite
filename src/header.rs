@@ -137,10 +137,13 @@ impl Header {
     }
 }
 
-/// After linking: the new page count, and the change counter bumped in both places so SQLite
-/// trusts the count (`change_counter == version_valid_for`, fileformat.html §1.3.7).
-pub(crate) fn patch_after_link(page1: &mut [u8], pages: u32) {
+/// After linking: the new page count, the freelist head (normally empty — see
+/// `link::write_freelist`), and the change counter bumped in both places so SQLite trusts the
+/// count (`change_counter == version_valid_for`, fileformat.html §1.3.7).
+pub(crate) fn patch_after_link(page1: &mut [u8], pages: u32, freelist_trunk: u32, freelist: u32) {
     put32(page1, OFF_PAGE_COUNT, pages);
+    put32(page1, OFF_FREELIST_TRUNK, freelist_trunk);
+    put32(page1, OFF_FREELIST_COUNT, freelist);
     let cc = be32(page1, OFF_CHANGE_COUNTER).wrapping_add(1);
     put32(page1, OFF_CHANGE_COUNTER, cc);
     put32(page1, OFF_VERSION_VALID_FOR, cc);
@@ -179,11 +182,16 @@ mod tests {
         let mut p = header_bytes(4096);
         put32(&mut p, OFF_CHANGE_COUNTER, 7);
         put32(&mut p, OFF_VERSION_VALID_FOR, 7);
-        patch_after_link(&mut p, 1234);
+        patch_after_link(&mut p, 1234, 0, 0);
         let h = Header::parse(Path::new("x"), &p).unwrap();
         assert_eq!(h.page_count, 1234);
         assert_eq!(h.change_counter, 8);
+        assert_eq!(h.freelist_count, 0);
         assert!(h.page_count_is_valid());
+        patch_after_link(&mut p, 1234, 99, 3);
+        let h = Header::parse(Path::new("x"), &p).unwrap();
+        assert_eq!(h.freelist_trunk, 99);
+        assert_eq!(h.freelist_count, 3);
     }
 
     #[test]
