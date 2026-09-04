@@ -509,6 +509,37 @@ Two findings worth carrying:
 
 `Options::threads` / `--threads N` selects it; the default is still the sequential walk.
 
+**Re-measured against the crate, on a second 4 vCPU host (2026-09-04).** The table above comes from
+the C port, whose parallel arms also set `fallocate` — which the crate does not implement (it
+needs `unsafe`). Timing the shipped binary instead, pre-change against current, round-robin, median of 5
+on the same six sources:
+
+| | link s | fsync s | link+fsync s | link MiB/s |
+| --- | ---: | ---: | ---: | ---: |
+| before this change | 5.41 | 4.21 | 9.63 | 434 |
+| `--threads 1` (I/O batching only) | 4.82 | 3.90 | 8.74 | 487 |
+| `--threads 4` | **1.16** | 4.23 | 5.37 | **2 027** |
+
+Absolute seconds do not transfer between hosts — this box runs the unbatched walk at 5.41 s where
+the spike's host ran it at 4.37 s — but two things are worth carrying into the design:
+
+- **The parallel walk is the win: 4.7× on the link, 434 MiB/s → 2.0 GiB/s**, and `--threads 6` on
+  4 vCPUs adds nothing over `--threads 4`.
+- **I/O batching on its own was worth only 1.12× here**, not the 2.24× the spike's host showed,
+  even though the syscall reduction is identical (600 966 `pread`s + 600 966 `pwrite`s → 2 886 +
+  3 498, exactly as measured there). Chunking trades a syscall for a `memcpy` through the slot
+  buffer, so what it is worth depends on how expensive the host's syscalls are; treat it as the
+  prerequisite that makes the parallel walk possible rather than as a win in its own right.
+
+The consequence for §4's end-to-end number is the one the spike predicted, sharpened: with the link
+at 1.16 s and the `fsync` at 4.23 s, **the destination write is now 79% of the stitch**, and further
+linker work is not where the time is.
+
+Correctness was checked at full scale rather than only on the suite's fixtures: on the 2 347 MiB
+workload the pre-change binary, `--threads 1` and `--threads 4` all produce a file with the same
+SHA-256, `integrity_check` clean and `freelist_count = 0` — the exact-reservation formula holding
+on 600 969 pages.
+
 ---
 
 ## 8. Awkward cases and their disposition
