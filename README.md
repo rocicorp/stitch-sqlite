@@ -64,8 +64,9 @@ leftmost path of every tree, and has SQLite open every table and index. `--verif
 The link is **parallel across sources** when you ask for it (`Options::threads`, `--threads N`):
 each source is given a reserved, disjoint range of destination pages, computed exactly from its
 header, and the walks run on that many threads writing to disjoint regions of one file. Measured
-on 6 sources x 2 M rows, the link phase goes 1.54 s to 0.61 s at four threads; what remains is
-the destination `fsync`, which is the disk.
+on 6 sources x 2 M rows (2 347 MiB), the link phase goes 4.82 s to 1.16 s at four threads — 487
+MiB/s to 2.0 GiB/s — and the output is byte-identical to the sequential one. What remains is the
+destination `fsync`, which is the disk and which no linker change removes.
 
 The test suite is differential: the stitched file is held to a reference built the ordinary way
 — every query through every index, forward, backward, and by point lookup, and the shape of every
